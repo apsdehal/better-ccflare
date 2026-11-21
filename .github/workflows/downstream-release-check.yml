@@ -1,0 +1,81 @@
+name: Check downstream patches against latest release
+
+on:
+  push:
+    branches: [codex/maintained]
+  schedule:
+    - cron: "19 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: downstream-release-check
+  cancel-in-progress: false
+
+jobs:
+  replay:
+    if: github.event.repository.fork
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Replay downstream changes
+        id: replay
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api repos/tombii/better-ccflare/releases/latest --jq .tag_name)
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          base=$(cat .downstream-base)
+          [[ "$base" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git fetch --no-tags https://github.com/tombii/better-ccflare.git "refs/tags/$base"
+          base_commit=$(git rev-parse 'FETCH_HEAD^{commit}')
+          git merge-base --is-ancestor "$base_commit" HEAD
+          git fetch --no-tags https://github.com/tombii/better-ccflare.git "refs/tags/$tag"
+          release=$(git rev-parse 'FETCH_HEAD^{commit}')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Maintained base: $base. Latest stable upstream release: $tag." >> "$GITHUB_STEP_SUMMARY"
+          git merge-base --is-ancestor "$base_commit" "$release"
+          if [[ "$release" == "$base_commit" && "$EVENT_NAME" == schedule ]]; then
+            echo "Already on the latest release." >> "$GITHUB_STEP_SUMMARY"
+            exit
+          fi
+          if [[ "$release" != "$base_commit" ]]; then
+            mapfile -t patches < <(git rev-list --reverse "$base_commit..HEAD")
+            test "${#patches[@]}" -gt 0
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git switch --detach "$release"
+            git cherry-pick "${patches[@]}"
+          fi
+          git diff --check "$release..HEAD"
+          git format-patch --stdout "$release..HEAD" > "$RUNNER_TEMP/ccflare-$tag.patch"
+          echo "validate=true" >> "$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@v2
+        if: steps.replay.outputs.validate == 'true'
+        with:
+          bun-version-file: .bun-version
+      - name: Run affected tests and build
+        if: steps.replay.outputs.validate == 'true'
+        run: |
+          bun install --frozen-lockfile
+          bun test packages/providers/src/providers/codex \
+            packages/proxy/src/__tests__/response-handler-worker-protocol.test.ts \
+            packages/proxy/src/handlers/__tests__/request-handler.test.ts \
+            packages/proxy/src/handlers/__tests__/request-handler-client-abort.test.ts
+          bun run typecheck
+          bun run build
+      - uses: actions/upload-artifact@v4
+        if: steps.replay.outputs.validate == 'true'
+        with:
+          name: downstream-${{ steps.replay.outputs.tag }}
+          path: ${{ runner.temp }}/ccflare-${{ steps.replay.outputs.tag }}.patch
+          if-no-files-found: error
