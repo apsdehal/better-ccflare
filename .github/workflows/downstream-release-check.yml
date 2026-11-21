@@ -67,12 +67,13 @@ jobs:
         if: steps.replay.outputs.validate == 'true'
         run: |
           bun install --frozen-lockfile
+          bun run build
           bun test packages/providers/src/providers/codex \
             packages/proxy/src/__tests__/response-handler-worker-protocol.test.ts \
             packages/proxy/src/handlers/__tests__/request-handler.test.ts \
-            packages/proxy/src/handlers/__tests__/request-handler-client-abort.test.ts
+            packages/proxy/src/handlers/__tests__/request-handler-client-abort.test.ts \
+            packages/proxy/src/handlers/__tests__/observed-upstream.test.ts
           bun run typecheck
-          bun run build
       - uses: actions/upload-artifact@v4
         if: steps.replay.outputs.validate == 'true'
         with:
