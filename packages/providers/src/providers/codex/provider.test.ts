@@ -317,6 +317,66 @@ describe("CodexProvider stream liveness", () => {
 });
 
 describe("CodexProvider request conversion", () => {
+	for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
+		it(`forwards Claude output_config effort ${effort} to the mapped Codex model`, async () => {
+			const provider = new CodexProvider();
+			const request = new Request("https://example.com/v1/messages", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: "claude-opus-5-5",
+					max_tokens: 100,
+					output_config: { effort },
+					thinking: { type: "adaptive" },
+					messages: [{ role: "user", content: "Hello" }],
+				}),
+			});
+			const transformed = await provider.transformRequestBody(
+				request,
+				codexAccount({
+					model_mappings: JSON.stringify({ opus: "gpt-6.1-sol" }),
+				}),
+			);
+			const body = await transformed.json();
+			expect(body.model).toBe("gpt-6.1-sol");
+			expect(body.reasoning).toEqual({ effort, context: "all_turns" });
+		});
+	}
+
+	it("prefers explicit reasoning effort over Claude output_config effort", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-opus-5-5",
+				max_tokens: 100,
+				reasoning: { effort: "low" },
+				output_config: { effort: "high" },
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+		const transformed = await provider.transformRequestBody(request);
+		expect((await transformed.json()).reasoning.effort).toBe("low");
+	});
+
+	it("rejects invalid Claude output_config effort instead of silently defaulting", async () => {
+		const provider = new CodexProvider();
+		const request = new Request("https://example.com/v1/messages", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: "claude-opus-5-5",
+				max_tokens: 100,
+				output_config: { effort: "extreme" },
+				messages: [{ role: "user", content: "Hello" }],
+			}),
+		});
+		await expect(provider.transformRequestBody(request)).rejects.toThrow(
+			"reasoning.effort must be one of:",
+		);
+	});
+
 	it("handles messages and synthetic count_tokens paths", () => {
 		const provider = new CodexProvider();
 		expect(provider.canHandle("/v1/messages")).toBeTrue();
@@ -827,6 +887,78 @@ describe("CodexProvider.processResponse", () => {
 		expect(deltaPos).toBeGreaterThanOrEqual(0);
 		expect(stopPos).toBeGreaterThan(deltaPos);
 		expect(transformedBody).toContain('"stop_reason":"tool_use"');
+	});
+
+	it.each([
+		{
+			input: { command: "printf probe", ws: { url: "", protocols: [] } },
+			expected: { command: "printf probe" },
+		},
+		{
+			input: { command: "", ws: { url: "wss://example.invalid/events" } },
+			expected: { ws: { url: "wss://example.invalid/events" } },
+		},
+		{
+			input: { command: "printf probe", ws: { url: "ws://example.invalid" } },
+			expected: {
+				command: "printf probe",
+				ws: { url: "ws://example.invalid" },
+			},
+		},
+	])("preserves only the actual Monitor source when possible: $input", async ({
+		input,
+		expected,
+	}) => {
+		const item = { type: "function_call", call_id: "call_1", name: "Monitor" };
+		const upstream = (stream = true) =>
+			new Response(
+				sseBody([
+					...eventLine("response.output_item.added", { item, output_index: 0 }),
+					...eventLine("response.function_call_arguments.delta", {
+						delta: JSON.stringify(input),
+						output_index: 0,
+					}),
+					...eventLine("response.output_item.done", { item, output_index: 0 }),
+					...eventLine("response.completed", {
+						response: {
+							id: "resp_test",
+							model: "gpt-5.4",
+							usage: { input_tokens: 1, output_tokens: 1 },
+						},
+					}),
+				]),
+				{
+					headers: {
+						"content-type": "text/event-stream",
+						"x-better-ccflare-request-stream": String(stream),
+					},
+				},
+			);
+
+		const streamed = await new CodexProvider().processResponse(
+			upstream(),
+			null,
+		);
+		const body = await streamed.text();
+		expect(body).toContain(
+			JSON.stringify({
+				type: "input_json_delta",
+				partial_json: JSON.stringify(expected),
+			}),
+		);
+		expect(body).toContain('"stop_reason":"tool_use"');
+
+		const buffered = await new CodexProvider().processResponse(
+			upstream(false),
+			null,
+		);
+		const result = (await buffered.json()) as { content: unknown[] };
+		expect(result.content).toContainEqual({
+			type: "tool_use",
+			id: "call_1",
+			name: "Monitor",
+			input: expected,
+		});
 	});
 
 	it("omits empty Read.pages from streaming tool-call arguments", async () => {
@@ -1635,6 +1767,7 @@ describe("CodexProvider.processResponse", () => {
 				part: { type: "output_text" },
 			}),
 			...eventLine("response.output_text.delta", { delta: "hello" }),
+			...eventLine("response.completed", { response: {} }),
 		]);
 		const response = new Response(upstreamBody, {
 			status: 200,

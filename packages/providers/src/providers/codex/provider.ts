@@ -41,6 +41,10 @@ import { normalizeCodexInputUsage, parseCodexUsageHeaders } from "./usage";
 
 const log = new Logger("CodexProvider");
 
+export const CODEX_STREAM_TRUNCATED = "codex_stream_truncated";
+
+const DESKTOP_START_SESSION_TOOL = "mcp__ccd_session__start_session";
+
 function recordCacheLifecycle(facts: CacheFacts): void {
 	log.info("Codex cache observation lifecycle", sanitizeCacheFacts(facts));
 	persistCacheTelemetry(facts, (dropped) =>
@@ -309,6 +313,7 @@ interface CodexTool {
 	type: "function";
 	name: string;
 	description?: string;
+	strict?: boolean;
 	parameters?: Record<string, unknown>;
 }
 
@@ -446,6 +451,7 @@ interface AnthropicRequest {
 	tools?: AnthropicTool[];
 	tool_choice?: AnthropicToolChoice;
 	reasoning?: { effort?: string };
+	output_config?: { effort?: string };
 	/** Claude Code sends a JSON-encoded object with a session_id here. */
 	metadata?: { user_id?: string };
 	[key: string]: unknown;
@@ -481,7 +487,9 @@ function toCodexInputImageItem(block: unknown): CodexInputImageItem | null {
 interface FunctionCallBuffer {
 	contentBlockIndex: number;
 	name: string;
-	arguments: string[];
+	argumentDeltas: string[];
+	finalArguments?: unknown;
+	malformedArguments?: boolean;
 }
 
 interface ContextWindowUsage {
@@ -569,6 +577,7 @@ export interface CodexProviderOptionsForTests {
 	streamHeartbeatIntervalMs?: number;
 	streamRawSilenceTimeoutMs?: number;
 	streamDrainDeadlineMs?: number;
+	streamFormatProbeTimeoutMs?: number;
 	continuationTtlMs?: number;
 	continuationMaxLanes?: number;
 	now?: () => number;
@@ -609,6 +618,7 @@ export class CodexProvider extends BaseProvider {
 	);
 	private readonly streamLivenessOptions: CodexStreamLivenessOptions;
 	private readonly streamDrainDeadlineMs: number;
+	private readonly streamFormatProbeTimeoutMs: number;
 	private readonly continuationTtlMs: number;
 	private readonly continuationMaxLanes: number;
 	private readonly now: () => number;
@@ -630,6 +640,8 @@ export class CodexProvider extends BaseProvider {
 		};
 		this.streamDrainDeadlineMs =
 			options.streamDrainDeadlineMs ?? CODEX_STREAM_DRAIN_DEADLINE_MS;
+		this.streamFormatProbeTimeoutMs =
+			options.streamFormatProbeTimeoutMs ?? 25_000;
 		this.continuationTtlMs =
 			options.continuationTtlMs ?? CODEX_CONTINUATION_TTL_MS;
 		this.continuationMaxLanes =
@@ -1113,6 +1125,102 @@ export class CodexProvider extends BaseProvider {
 		}
 	}
 
+	private async probeResponseFormat(
+		response: Response,
+		drainAbort?: AbortController,
+	): Promise<Response> {
+		const body = response.body;
+		if (!body) return response;
+		const reader = body.getReader();
+		const buffered: Uint8Array[] = [];
+		const decoder = new TextDecoder();
+		const prefixes = ["event:", "data:", "id:", "retry:", ":"];
+		let prefix = "";
+		let inspectedBytes = 0;
+		let isSse = false;
+		let failed = false;
+		let pendingRead: ReturnType<typeof reader.read> | undefined;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeoutError = new Error(
+			"Codex response format probe timed out before streaming began.",
+		);
+		const deadline = new Promise<never>((_resolve, reject) => {
+			timer = setTimeout(
+				() => reject(timeoutError),
+				this.streamFormatProbeTimeoutMs,
+			);
+		});
+		try {
+			while (inspectedBytes < 1024) {
+				pendingRead = reader.read();
+				const { value, done } = await Promise.race([pendingRead, deadline]);
+				pendingRead = undefined;
+				if (done) break;
+				buffered.push(value);
+				const sample = value.subarray(0, 1024 - inspectedBytes);
+				inspectedBytes += sample.byteLength;
+				prefix += decoder.decode(sample, { stream: true });
+				const trimmed = prefix.trimStart();
+				isSse = prefixes.some((field) => trimmed.startsWith(field));
+				if (isSse || !prefixes.some((field) => field.startsWith(trimmed)))
+					break;
+			}
+		} catch (error) {
+			failed = true;
+			if (error === timeoutError) {
+				log.warn("codex_response_format_probe_timeout", {
+					requestId: response.headers.get("x-better-ccflare-request-id"),
+					timeoutMs: this.streamFormatProbeTimeoutMs,
+				});
+			}
+			drainAbort?.abort(error);
+			void drainReaderWithDeadline(reader, {
+				deadlineMs: this.streamDrainDeadlineMs,
+				drainAbort,
+				beforeDrain: async () => {
+					await pendingRead?.catch(() => undefined);
+				},
+				swallowErrors: true,
+			});
+			throw error;
+		} finally {
+			if (timer) clearTimeout(timer);
+			if (!failed) reader.releaseLock();
+		}
+		const headers = new Headers(response.headers);
+		if (isSse) headers.set("content-type", "text/event-stream");
+		// Replay only the inspected chunks, then pipe the untouched remainder.
+		// pipeTo supplies backpressure/cancellation; no tee retains a second body.
+		const { readable, writable } = new TransformStream<
+			Uint8Array,
+			Uint8Array
+		>();
+		const pump = async () => {
+			const writer = writable.getWriter();
+			try {
+				for (const chunk of buffered) await writer.write(chunk);
+			} finally {
+				writer.releaseLock();
+			}
+			await body.pipeTo(writable);
+		};
+		void pump().catch(async (error) => {
+			drainAbort?.abort(error);
+			if (!body.locked) {
+				await drainReaderWithDeadline(body.getReader(), {
+					deadlineMs: this.streamDrainDeadlineMs,
+					drainAbort,
+					swallowErrors: true,
+				});
+			}
+		});
+		return new Response(readable, {
+			status: response.status,
+			statusText: response.statusText,
+			headers,
+		});
+	}
+
 	async processResponse(
 		response: Response,
 		_account: Account | null,
@@ -1219,8 +1327,20 @@ export class CodexProvider extends BaseProvider {
 		}
 
 		if (response.ok && response.body !== null) {
-			const probeText = await response.text();
+			const probed = await this.probeResponseFormat(response, drainAbort);
+			if (probed.headers.get("content-type") === "text/event-stream") {
+				log.warn(
+					`Codex returned successful response without SSE content-type (${contentType ?? "<missing>"}); streaming detected SSE body`,
+				);
+				return this.processResponse(
+					probed,
+					_account,
+					_requestHeaders,
+					drainAbort,
+				);
+			}
 			if (nativeResponses) {
+				const probeText = await probed.text();
 				const continuationResult = requestId
 					? this.pendingContinuationByRequest.get(requestId)
 					: undefined;
@@ -1236,43 +1356,10 @@ export class CodexProvider extends BaseProvider {
 					continuationResult,
 				);
 			}
-			const trimmed = probeText.trimStart();
-			const isSseLike = trimmed.startsWith("event:");
-
-			if (isSseLike) {
-				log.warn(
-					`Codex returned successful response without SSE content-type (${contentType ?? "<missing>"}); transforming as ${requestedStream ? "SSE" : "JSON"}`,
-				);
-				// Preserve Responses Lite custom tool calls.
-				if (hasCustomToolCallEvent(probeText)) {
-					log.info(
-						"[codex:passthrough] Custom tool call events detected, bypassing Anthropic conversion",
-					);
-					return this.buildCustomToolCallPassthroughResponse(
-						probeText,
-						response,
-					);
-				}
-				// Keep internal request correlation through the internal SSE rebuild.
-				// The final public response sanitizes these headers after conversion.
-				const headers = new Headers(response.headers);
-				headers.set("content-type", "text/event-stream");
-				const sseResponse = new Response(probeText, {
-					status: response.status,
-					statusText: response.statusText,
-					headers,
-				});
-				if (requestedStream) {
-					return this.transformStreamingResponse(sseResponse, drainAbort);
-				}
-				return this.transformSseResponseToJson(sseResponse);
-			}
-
-			const headers = sanitizeResponseHeaders(response.headers);
-			return new Response(probeText, {
+			return new Response(probed.body, {
 				status: response.status,
 				statusText: response.statusText,
-				headers,
+				headers: sanitizeResponseHeaders(response.headers),
 			});
 		}
 
@@ -2368,6 +2455,40 @@ export class CodexProvider extends BaseProvider {
 			}
 		}
 
+		if (name === "Monitor") {
+			const { command, ws } = sanitized;
+			const blank = (value: unknown) =>
+				value == null || (typeof value === "string" && !value.trim());
+			const wsFields =
+				ws && typeof ws === "object" && !Array.isArray(ws)
+					? (ws as Record<string, unknown>)
+					: undefined;
+			// Codex may fill optional fields with empty placeholders. Preserve
+			// calls with two real sources so the client rejects the ambiguity.
+			const emptyWs =
+				wsFields &&
+				Object.keys(wsFields).every(
+					(key) => key === "url" || key === "protocols",
+				) &&
+				blank(wsFields.url) &&
+				(wsFields.protocols == null ||
+					(Array.isArray(wsFields.protocols) &&
+						wsFields.protocols.length === 0));
+			if (
+				typeof command === "string" &&
+				command.trim() &&
+				(blank(ws) || emptyWs)
+			) {
+				delete sanitized.ws;
+			} else if (
+				blank(command) &&
+				typeof wsFields?.url === "string" &&
+				/^wss?:\/\/[^/\s]/i.test(wsFields.url)
+			) {
+				delete sanitized.command;
+			}
+		}
+
 		if (name === "WebSearch") {
 			const allowedDomains = this.cleanWebSearchDomains(
 				sanitized.allowed_domains,
@@ -2381,6 +2502,27 @@ export class CodexProvider extends BaseProvider {
 			// Anthropic-compatibility boundary. Drop block-lists intentionally rather
 			// than forwarding a field the local tool schema rejects.
 			delete sanitized.blocked_domains;
+		}
+
+		if (name === DESKTOP_START_SESSION_TOOL) {
+			// Desktop expects omitted optional values. In particular, a blank
+			// host fails validation; omission keeps Desktop's routing defaults.
+			for (const key of [
+				"proposal_id",
+				"model",
+				"host",
+				"cwd",
+				"environment",
+				"repository",
+				"source_branch",
+				"branch_name",
+				"preset",
+			]) {
+				const value = sanitized[key];
+				if (value === null || (typeof value === "string" && !value.trim())) {
+					delete sanitized[key];
+				}
+			}
 		}
 
 		return sanitized;
@@ -2397,7 +2539,7 @@ export class CodexProvider extends BaseProvider {
 	private sanitizeToolUsePartialJson(
 		name: string,
 		partialJson: string,
-	): string {
+	): string | undefined {
 		try {
 			const input = JSON.parse(partialJson) as unknown;
 			if (typeof input !== "object" || input === null || Array.isArray(input)) {
@@ -2405,7 +2547,7 @@ export class CodexProvider extends BaseProvider {
 			}
 			return JSON.stringify(this.sanitizeToolUseInput(name, input));
 		} catch {
-			return partialJson;
+			return undefined;
 		}
 	}
 
@@ -2788,7 +2930,13 @@ export class CodexProvider extends BaseProvider {
 			tools = body.tools.map((t) => ({
 				type: "function" as const,
 				name: t.name,
-				description: t.description,
+				description:
+					t.name === "Monitor"
+						? `${t.description ?? ""} Supply exactly one of command or ws. Omit the unused field entirely.`.trim()
+						: t.description,
+				...(t.name === "Monitor" || t.name === DESKTOP_START_SESSION_TOOL
+					? { strict: false }
+					: {}),
 				parameters: sanitizeSchemaForOpenAI(t.input_schema) as
 					| Record<string, unknown>
 					| undefined,
@@ -2800,7 +2948,9 @@ export class CodexProvider extends BaseProvider {
 			| { effort?: string; summary?: unknown; context?: unknown }
 			| undefined;
 		const reasoningEffort =
-			passthroughReasoning?.effort ?? body.reasoning?.effort;
+			passthroughReasoning?.effort ??
+			body.reasoning?.effort ??
+			body.output_config?.effort;
 		const reasoningResolution = resolveReasoningEffort(reasoningEffort, {
 			sourceModel: body.model,
 			targetModel: model,
@@ -3052,12 +3202,11 @@ export class CodexProvider extends BaseProvider {
 					}
 				}
 				if (pending) processLine(pending);
-			} catch (readError) {
-				// releaseLock() alone doesn't free the native buffer backing the
-				// stream on Bun (#382) — drain to `done` first, which also
-				// releases the lock.
-				await drainReader(reader);
-				throw readError;
+			} catch {
+				errorPayload = this.toAnthropicErrorPayload({
+					type: "api_error",
+					message: "Codex upstream stream failed while generating a response.",
+				});
 			} finally {
 				reader.releaseLock();
 			}
@@ -3132,9 +3281,9 @@ export class CodexProvider extends BaseProvider {
 				`[codex:model-debug] request_id=${requestId} transformSseResponseToJson used fallback model=gpt-5.4 (startMessage.model missing)`,
 			);
 		}
-		const stopReason = content.some((block) => block.type === "tool_use")
-			? "tool_use"
-			: "end_turn";
+		const delta = (messageDeltaPayload as Record<string, unknown> | null)
+			?.delta as { stop_reason?: string } | undefined;
+		const stopReason = delta?.stop_reason;
 		const jsonPayload = {
 			id:
 				typeof startMessage.id === "string"
@@ -3298,6 +3447,12 @@ export class CodexProvider extends BaseProvider {
 			});
 		};
 
+		const writeStreamError = (message: string, code?: string) =>
+			writeSSE(
+				"error",
+				this.toAnthropicErrorPayload({ type: "api_error", message, code }),
+			);
+
 		const processEvents = async () => {
 			const reader = response.body?.getReader();
 			let upstreamCancelStarted = false;
@@ -3370,29 +3525,15 @@ export class CodexProvider extends BaseProvider {
 						const timeoutMessage =
 							"Codex upstream timed out while waiting for response data.";
 						cancelUpstreamOnce(new Error(timeoutMessage));
-						if (!state.hasSentTerminalEvents) {
-							await ensureMessageStart();
-							if (state.hasSentContentBlockStart) {
-								await writeSSE("content_block_stop", {
-									type: "content_block_stop",
-									index: state.contentBlockIndex,
-								});
-								state.contentBlockIndex++;
-								state.hasSentContentBlockStart = false;
-							}
-							await writeSSE("error", {
-								type: "error",
-								error: { type: "api_error", message: timeoutMessage },
-							});
-							state.hasSentTerminalEvents = true;
-						}
+						if (!state.hasSentTerminalEvents || controlledMessages)
+							await writeStreamError(timeoutMessage);
 						return;
 					}
 					if (outcome.type === "upstream_error") throw outcome.error;
 
 					const { value, done } = outcome.result;
 					if (done) {
-						cleanEof = state.buffer.trim().length === 0;
+						cleanEof = (state.buffer + decoder.decode()).trim().length === 0;
 						break;
 					}
 
@@ -3410,76 +3551,74 @@ export class CodexProvider extends BaseProvider {
 
 						if (controlledMessages)
 							this.observeNativeTerminalEvent(requestId, eventText);
-						const eventLine = eventText
-							.split(/\r?\n/)
-							.find((l) => l.startsWith("event:"));
-						const dataLine = eventText
-							.split(/\r?\n/)
-							.find((l) => l.startsWith("data:"));
-
-						if (!eventLine || !dataLine) continue;
-
-						const eventName = eventLine.slice("event:".length).trim();
-						const dataStr = dataLine.slice("data:".length).trim();
-
-						if (dataStr === "[DONE]") continue;
+						const lines = eventText.split(/\r?\n/);
+						const eventLine = lines.findLast((line) =>
+							line.startsWith("event:"),
+						);
+						const dataText = lines
+							.filter((line) => line.startsWith("data:"))
+							.map((line) => line.slice("data:".length))
+							.join("\n")
+							.trim();
+						if (!dataText || dataText === "[DONE]") continue;
 
 						let data: Record<string, unknown>;
 						try {
-							data = JSON.parse(dataStr);
+							data = JSON.parse(dataText);
 						} catch {
 							continue;
 						}
+						if (!data || typeof data !== "object" || Array.isArray(data))
+							continue;
+						const eventName = eventLine?.slice("event:".length).trim();
+						const dataType = typeof data.type === "string" ? data.type : "";
+						if (eventName && dataType && eventName !== dataType) continue;
 
 						await this.handleCodexEvent(
-							eventName,
+							eventName || dataType,
 							data,
 							state,
 							writeSSE,
 							ensureMessageStart,
 						);
-						if (state.hasSentTerminalEvents && !controlledMessages) {
+						if (
+							state.upstreamError ||
+							(state.hasSentTerminalEvents && !controlledMessages)
+						) {
 							streamLiveness.stop();
 							cancelUpstreamOnce("Codex terminal response received");
-							break;
+							// A later failure may arrive while the successful terminal
+							// frames are still buffered for checkpoint validation.
+							if (state.upstreamError && terminalFrames.length > 0) {
+								await writeSSE(
+									"error",
+									this.toAnthropicErrorPayload(state.upstreamError),
+								);
+							}
+							return;
 						}
 					}
 				}
 
-				if (state.upstreamError) {
-					return;
-				}
-
-				// Flush any remaining
-				await ensureMessageStart();
-
-				// Close any open content block
-				if (state.hasSentContentBlockStart) {
-					await writeSSE("content_block_stop", {
-						type: "content_block_stop",
-						index: state.contentBlockIndex,
-					});
-				}
-
-				// Final message_delta + message_stop if upstream never sent response.completed
-				if (!state.hasSentTerminalEvents) {
-					await writeSSE("message_delta", {
-						type: "message_delta",
-						delta: {
-							stop_reason: state.sawToolUse ? "tool_use" : "end_turn",
-							stop_sequence: null,
-						},
-						usage: { output_tokens: state.outputTokens },
-					});
-					await writeSSE("message_stop", { type: "message_stop" });
+				if (!state.hasSentTerminalEvents || !cleanEof) {
+					await writeStreamError(
+						"Codex upstream closed before the response stream finished.",
+						CODEX_STREAM_TRUNCATED,
+					);
 				}
 			} catch (error) {
-				log.error("Error processing Codex SSE stream:", error);
+				streamLiveness.stop();
 				cancelUpstreamOnce(error);
+				if (!state.hasSentTerminalEvents || controlledMessages) {
+					// Preserve read failure for the response observer. It can tell whether
+					// the incoming request was cancelled before the upstream rejected.
+					await writer.abort(error).catch(() => undefined);
+				}
 			} finally {
 				streamLiveness.stop();
 				if (!upstreamCancelStarted) {
 					await streamLiveness.settlePendingReadForCleanup();
+					reader?.releaseLock();
 				}
 				// Do NOT await upstreamDrainPromise here: draining exists to free the
 				// native off-heap buffer behind the upstream response (issue #382),
@@ -3492,7 +3631,7 @@ export class CodexProvider extends BaseProvider {
 				try {
 					if (controlledMessages) {
 						const success =
-							cleanEof && !upstreamCancelStarted && !state.upstreamError;
+							cleanEof && state.hasSentTerminalEvents && !upstreamCancelStarted;
 						if (success) {
 							for (const frame of terminalFrames) await writer.write(frame);
 						}
@@ -3678,10 +3817,17 @@ export class CodexProvider extends BaseProvider {
 					state.sawToolUse = true;
 
 					if (state.hasSentContentBlockStart) {
-						await writeSSE("content_block_stop", {
-							type: "content_block_stop",
-							index: state.contentBlockIndex,
-						});
+						const isOpenFunctionCallBlock = [
+							...state.functionCallBlocks.values(),
+						].some(
+							(block) => block.contentBlockIndex === state.contentBlockIndex,
+						);
+						if (!isOpenFunctionCallBlock) {
+							await writeSSE("content_block_stop", {
+								type: "content_block_stop",
+								index: state.contentBlockIndex,
+							});
+						}
 						state.contentBlockIndex++;
 						state.hasSentContentBlockStart = false;
 					}
@@ -3698,7 +3844,7 @@ export class CodexProvider extends BaseProvider {
 						state.functionCallBlocks.set(outputIndex, {
 							contentBlockIndex: blockIdx,
 							name,
-							arguments: [],
+							argumentDeltas: [],
 						});
 					}
 				}
@@ -3751,14 +3897,15 @@ export class CodexProvider extends BaseProvider {
 				break;
 			}
 
-			case "response.function_call_arguments.delta": {
-				const delta = data.delta as string | undefined;
-				const outputIndex = data.output_index as number | undefined;
-				if (delta && outputIndex !== undefined) {
-					const buffer = state.functionCallBlocks.get(outputIndex);
-					if (buffer) {
-						buffer.arguments.push(delta);
-					}
+			case "response.function_call_arguments.delta":
+			case "response.function_call_arguments.done": {
+				if (typeof data.output_index !== "number") break;
+				const buffer = state.functionCallBlocks.get(data.output_index);
+				if (!buffer) break;
+				if (eventName === "response.function_call_arguments.done") {
+					buffer.finalArguments = data.arguments ?? null;
+				} else if (typeof data.delta === "string" && data.delta.length > 0) {
+					buffer.argumentDeltas.push(data.delta);
 				}
 				break;
 			}
@@ -3774,15 +3921,29 @@ export class CodexProvider extends BaseProvider {
 							? state.functionCallBlocks.get(outputIndex)
 							: undefined;
 					if (buffer) {
+						if (item?.status === "incomplete") break;
+						const finalArguments =
+							item?.arguments !== undefined
+								? item.arguments
+								: buffer.finalArguments;
+						const args =
+							finalArguments === undefined
+								? buffer.argumentDeltas.join("") || "{}"
+								: finalArguments;
+						const partialJson =
+							typeof args === "string"
+								? this.sanitizeToolUsePartialJson(buffer.name, args)
+								: undefined;
+						if (partialJson === undefined) {
+							buffer.malformedArguments = true;
+							break;
+						}
 						await writeSSE("content_block_delta", {
 							type: "content_block_delta",
 							index: buffer.contentBlockIndex,
 							delta: {
 								type: "input_json_delta",
-								partial_json: this.sanitizeToolUsePartialJson(
-									buffer.name,
-									buffer.arguments.join(""),
-								),
+								partial_json: partialJson,
 							},
 						});
 						await writeSSE("content_block_stop", {
@@ -3803,7 +3964,12 @@ export class CodexProvider extends BaseProvider {
 					break;
 				}
 
-				if (state.hasSentContentBlockStart) {
+				if (
+					state.hasSentContentBlockStart &&
+					![...state.functionCallBlocks.values()].some(
+						(block) => block.contentBlockIndex === state.contentBlockIndex,
+					)
+				) {
 					await writeSSE("content_block_stop", {
 						type: "content_block_stop",
 						index: state.contentBlockIndex,
@@ -3839,7 +4005,49 @@ export class CodexProvider extends BaseProvider {
 			case "response.completed": {
 				if (state.upstreamError || state.hasSentTerminalEvents) break;
 				const resp = data.response as Record<string, unknown> | undefined;
-				const usage = resp?.usage as
+				if (!resp || typeof resp !== "object" || Array.isArray(resp)) break;
+				if (resp.status === "failed" || resp.status === "cancelled") {
+					await this.handleCodexEvent(
+						"response.failed",
+						data,
+						state,
+						writeSSE,
+						ensureMessageStart,
+					);
+					break;
+				}
+				if (
+					eventName === "response.completed" &&
+					resp.status &&
+					resp.status !== "completed" &&
+					resp.status !== "incomplete"
+				)
+					break;
+				await ensureMessageStart();
+				const incompleteDetails = resp.incomplete_details as
+					| { reason?: string }
+					| undefined;
+				const isIncomplete =
+					eventName === "response.incomplete" || resp.status === "incomplete";
+				if (!isIncomplete && state.functionCallBlocks.size > 0) {
+					const malformed = [...state.functionCallBlocks.values()].some(
+						(buffer) => buffer.malformedArguments,
+					);
+					state.upstreamError = {
+						type: "api_error",
+						message: malformed
+							? "Codex upstream returned malformed tool arguments."
+							: "Codex upstream completed with an unfinished tool call.",
+					};
+					await writeSSE(
+						"error",
+						this.toAnthropicErrorPayload(state.upstreamError),
+					);
+					state.hasSentTerminalEvents = true;
+					break;
+				}
+
+				const usage = resp.usage as
 					| {
 							input_tokens?: number;
 							output_tokens?: number;
@@ -3875,6 +4083,15 @@ export class CodexProvider extends BaseProvider {
 				state.cacheReadInputTokens = normalizedInput.cacheReadInputTokens;
 				state.cacheCreationInputTokens = cacheCreation;
 				state.contextWindow = this.extractContextWindow(resp, usage);
+				for (const buffer of state.functionCallBlocks.values()) {
+					await writeSSE("content_block_stop", {
+						type: "content_block_stop",
+						index: buffer.contentBlockIndex,
+					});
+					if (buffer.contentBlockIndex === state.contentBlockIndex)
+						state.hasSentContentBlockStart = false;
+				}
+				state.functionCallBlocks.clear();
 				// Close any lingering content block
 				if (state.hasSentContentBlockStart) {
 					await writeSSE("content_block_stop", {
@@ -3884,11 +4101,6 @@ export class CodexProvider extends BaseProvider {
 					state.hasSentContentBlockStart = false;
 				}
 
-				const incompleteDetails = resp?.incomplete_details as
-					| { reason?: string }
-					| undefined;
-				const isIncomplete =
-					eventName === "response.incomplete" || resp?.status === "incomplete";
 				// An incomplete response never resolves to a success stop_reason:
 				// content_filter -> refusal (client discards partial output); every
 				// other reason, including unknown future ones, -> max_tokens (generic

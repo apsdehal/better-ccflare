@@ -1,4 +1,7 @@
-import { drainReaderWithDeadline } from "@better-ccflare/providers";
+import {
+	CODEX_STREAM_TRUNCATED,
+	drainReaderWithDeadline,
+} from "@better-ccflare/providers";
 
 export const ANTHROPIC_MESSAGE_STOP_FRAME =
 	'event: message_stop\ndata: {"type":"message_stop"}\n\n';
@@ -82,6 +85,8 @@ export interface AnthropicTerminalRecoveryOptions {
 	 * back to releasing the reader lock only.
 	 */
 	drainAbort?: AbortController;
+	/** Incoming client signal, separate from the proxy's drain deadline signal. */
+	clientSignal?: AbortSignal;
 	onRecovery?: (reason: AnthropicTerminalRecoveryReason) => void;
 	onCancelError?: (
 		error: unknown,
@@ -116,7 +121,7 @@ export function createAnthropicTerminalRecoveryStream(
 		options.gracePeriodMs ?? ANTHROPIC_TERMINAL_RECOVERY_GRACE_MS;
 	const drainDeadlineMs =
 		options.drainDeadlineMs ?? ANTHROPIC_DRAIN_DEADLINE_MS;
-	const drainAbort = options.drainAbort;
+	const { drainAbort, clientSignal } = options;
 	const reader = upstream.getReader();
 	const decoder = new TextDecoder();
 
@@ -125,7 +130,7 @@ export function createAnthropicTerminalRecoveryStream(
 	let terminalDeltaSeen = false;
 	let provisionalTerminalDeltaSeen = false;
 	let messageStopSeen = false;
-	let terminalFailureSeen = false;
+	let terminalFailure: "error" | "truncated" | null = null;
 	let recoveryDisabled = false;
 	let unknownContentBlockOpen = false;
 	let recoveryHappened = false;
@@ -214,24 +219,10 @@ export function createAnthropicTerminalRecoveryStream(
 	};
 
 	const determineTerminalState = (): AnthropicTerminalState => {
-		// Client-initiated cancel takes precedence over every upstream-driven
-		// observation: Claude Code cancels streams routinely (Esc, tool
-		// interrupts, client aborts). Recording those as `truncated` would
-		// poison the success-rate metrics at a much higher rate than the
-		// 0.027% upstream TCP-close rate we're fixing here. This is not an
-		// upstream failure or a proxy defect — it's the client walking away
-		// mid-conversation. The caller (response-handler) preserves the
-		// pre-existing header-based success for this state, so the only
-		// observable change is the new column recording what happened.
-		if (clientCancelled) return "client_cancelled";
-		// Explicit upstream failure takes precedence over anything observed in
-		// the partial body — a mid-stream error event is the most authoritative
-		// signal we have, even if a stop_reason delta happened to land first.
-		if (terminalFailureSeen) return "error";
-		// Native completion: protocol endpoint (message_stop) was observed.
-		// stop_reason may or may not have been seen alongside it, but
-		// message_stop alone is sufficient to declare the stream complete.
+		// An observed protocol outcome takes precedence over a later client cancel.
+		if (terminalFailure) return terminalFailure;
 		if (messageStopSeen) return "complete";
+		if (clientCancelled || clientSignal?.aborted) return "client_cancelled";
 		// Stop_reason was seen but message_stop never arrived. If we
 		// synthesized the terminator the client receives a well-formed
 		// stream and we count it as recovered; otherwise the protocol
@@ -277,7 +268,7 @@ export function createAnthropicTerminalRecoveryStream(
 		if (
 			finalized ||
 			messageStopSeen ||
-			terminalFailureSeen ||
+			terminalFailure ||
 			recoveryDisabled ||
 			!terminalDeltaSeen ||
 			unknownContentBlockOpen ||
@@ -300,8 +291,10 @@ export function createAnthropicTerminalRecoveryStream(
 		);
 	};
 
-	const markTerminalFailure = (): void => {
-		terminalFailureSeen = true;
+	const markTerminalFailure = (
+		state: "error" | "truncated" = "error",
+	): void => {
+		terminalFailure = state;
 		terminalDeltaSeen = false;
 		provisionalTerminalDeltaSeen = false;
 		clearRecoveryTimer();
@@ -328,12 +321,8 @@ export function createAnthropicTerminalRecoveryStream(
 			if (field === "data") dataLines.push(value);
 		}
 
-		if (eventType === "error") {
-			markTerminalFailure();
-			return;
-		}
-
 		if (dataLines.length === 0) {
+			if (eventType === "error") markTerminalFailure();
 			if (!provisional && eventType !== undefined && eventType !== "ping") {
 				disableRecovery();
 			}
@@ -344,16 +333,22 @@ export function createAnthropicTerminalRecoveryStream(
 		try {
 			parsed = JSON.parse(dataLines.join("\n")) as unknown;
 		} catch {
+			if (eventType === "error") markTerminalFailure();
 			if (!provisional && eventType !== "ping") disableRecovery();
 			return;
 		}
 		if (!isRecord(parsed)) {
+			if (eventType === "error") markTerminalFailure();
 			if (!provisional && eventType !== "ping") disableRecovery();
 			return;
 		}
 
-		if (parsed.type === "error") {
-			markTerminalFailure();
+		if (eventType === "error" || parsed.type === "error") {
+			markTerminalFailure(
+				isRecord(parsed.error) && parsed.error.code === CODEX_STREAM_TRUNCATED
+					? "truncated"
+					: "error",
+			);
 			return;
 		}
 		if (eventType === "ping") return;
@@ -414,7 +409,7 @@ export function createAnthropicTerminalRecoveryStream(
 				}
 				if (
 					terminalDeltaSeen &&
-					!terminalFailureSeen &&
+					!terminalFailure &&
 					!recoveryDisabled &&
 					!unknownContentBlockOpen &&
 					openContentBlocks.size === 0
@@ -453,7 +448,7 @@ export function createAnthropicTerminalRecoveryStream(
 				provisionalTerminalDeltaSeen = false;
 			}
 			if (
-				!terminalFailureSeen &&
+				!terminalFailure &&
 				!recoveryDisabled &&
 				!unknownContentBlockOpen &&
 				openContentBlocks.size === 0
@@ -510,7 +505,7 @@ export function createAnthropicTerminalRecoveryStream(
 			recoveryTimer !== null ||
 			finalized ||
 			messageStopSeen ||
-			terminalFailureSeen ||
+			terminalFailure ||
 			recoveryDisabled ||
 			(!terminalDeltaSeen && !provisionalTerminalDeltaSeen) ||
 			!upstreamReadPending
@@ -597,8 +592,9 @@ export function createAnthropicTerminalRecoveryStream(
 						!messageStopSeenBeforeBufferedEvent && messageStopSeen;
 					if (
 						terminalDeltaSeen &&
+						!clientSignal?.aborted &&
 						!messageStopSeen &&
-						!terminalFailureSeen &&
+						!terminalFailure &&
 						!recoveryDisabled &&
 						!unknownContentBlockOpen &&
 						openContentBlocks.size === 0
@@ -624,16 +620,9 @@ export function createAnthropicTerminalRecoveryStream(
 				if (finalized) return;
 				finalized = true;
 				clearRecoveryTimer();
-				// reader.read() rejection is a transport/stream-level failure
-				// from upstream — distinct from a clean EOF (the `done:true`
-				// branch above) and distinct from a client-initiated cancel
-				// (handled in the `cancel()` handler, which sets
-				// `clientCancelled` and wins precedence). Without this flag,
-				// determineTerminalState() would classify the rejection as
-				// "truncated" — silently conflating a real upstream failure
-				// with a mid-content TCP close and poisoning the new
-				// stream_terminal_state column.
-				markTerminalFailure();
+				// The incoming abort signal may reach fetch before downstream cancel().
+				// Without that signal, a read rejection is an upstream transport error.
+				if (!clientSignal?.aborted && !terminalFailure) markTerminalFailure();
 				fireTerminalState();
 				controller.error(error);
 				reader.releaseLock();
@@ -644,10 +633,7 @@ export function createAnthropicTerminalRecoveryStream(
 			if (finalized) return;
 			finalized = true;
 			clearRecoveryTimer();
-			// Downstream (client) cancellation, not upstream failure. Set
-			// before firing so determineTerminalState classifies this as
-			// "client_cancelled" and response-handler preserves the prior
-			// header-based success — see comment in determineTerminalState.
+
 			clientCancelled = true;
 			fireTerminalState();
 			return cancelUpstream(reason);

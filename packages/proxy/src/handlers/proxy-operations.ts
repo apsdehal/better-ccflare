@@ -4412,6 +4412,7 @@ async function proxyWithAccountAttempt(
 				comboName: requestMeta.comboName,
 				apiKeyId,
 				apiKeyName,
+				clientSignal: req.signal,
 				drainAbort: drainAbortController,
 			},
 			{ ...ctx, provider },

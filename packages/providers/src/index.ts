@@ -114,4 +114,7 @@ registry.registerProvider(new OllamaCloudProvider());
 registry.registerProvider(new AnthropicCompatibleProvider());
 registry.registerProvider(new MetaProvider());
 
-export { recoverCodexMessagesContinuation } from "./providers/codex/provider";
+export {
+	CODEX_STREAM_TRUNCATED,
+	recoverCodexMessagesContinuation,
+} from "./providers/codex/provider";

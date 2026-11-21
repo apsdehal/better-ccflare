@@ -8,6 +8,7 @@ import {
 	spyOn,
 } from "bun:test";
 import { requestEvents } from "@better-ccflare/core";
+import { CodexProvider } from "@better-ccflare/providers/codex";
 import type { Account } from "@better-ccflare/types";
 import * as modelCatalogModule from "../model-catalog";
 import { forwardToClient } from "../response-handler";
@@ -297,6 +298,131 @@ describe("forwardToClient usage-collector protocol", () => {
 				ctx,
 			),
 		).resolves.toBeInstanceOf(Response);
+	});
+
+	async function forwardTestStream(
+		body: string | ReadableStream<Uint8Array> | Response,
+		clientSignal?: AbortSignal,
+		originalModel?: string,
+	) {
+		const ctx = createCtx();
+		ctx.provider.isStreamingResponse = () => true;
+		return forwardToClient(
+			{
+				requestId: "req-stream-outcome",
+				method: "POST",
+				path: "/v1/messages",
+				account: null,
+				requestHeaders: new Headers(),
+				requestBody: null,
+				response:
+					body instanceof Response
+						? body
+						: new Response(body, {
+								headers: { "content-type": "text/event-stream" },
+							}),
+				timestamp: Date.now(),
+				retryAttempt: 0,
+				failoverAttempts: 0,
+				clientSignal,
+				originalModel,
+			},
+			ctx,
+		);
+	}
+
+	const partialFrame =
+		'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n';
+
+	async function translateCodex(body: string | ReadableStream<Uint8Array>) {
+		return new CodexProvider().processResponse(
+			new Response(body, {
+				headers: { "content-type": "text/event-stream" },
+			}),
+			null,
+		);
+	}
+
+	const partialCodexFrame =
+		'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\n';
+
+	it("records translated Codex truncation before finalizing usage", async () => {
+		const { ends } = createMockCollector();
+		const response = await forwardTestStream(
+			await translateCodex(partialCodexFrame),
+		);
+		expect(await response.text()).toContain("event: error");
+		expect(ends).toEqual([
+			expect.objectContaining({
+				success: false,
+				streamTerminalState: "truncated",
+				error: "stream_truncated_mid_content",
+			}),
+		]);
+	});
+
+	it("records cancellation once when the client cancels with a read in flight", async () => {
+		const { ends } = createMockCollector();
+		let upstream!: ReadableStreamDefaultController<Uint8Array>;
+		const response = await forwardTestStream(
+			new ReadableStream<Uint8Array>({
+				start(controller) {
+					upstream = controller;
+					controller.enqueue(new TextEncoder().encode(partialFrame));
+				},
+			}),
+			undefined,
+			"caller-model",
+		);
+		const reader = response.body?.getReader();
+		if (!reader) throw new Error("Expected a streaming response");
+		expect((await reader.read()).done).toBe(false);
+		expect((await reader.read()).done).toBe(false); // SSE delimiter from model rewriting
+		const pending = reader.read();
+		await reader.cancel("client interrupted");
+		expect(await pending).toEqual({ done: true, value: undefined });
+		// Release the pending upstream drain only after the client walked away.
+		upstream.close();
+		expect(ends).toEqual([
+			expect.objectContaining({
+				success: true,
+				streamTerminalState: "client_cancelled",
+			}),
+		]);
+	});
+
+	it("recognizes a client disconnect when the upstream read rejects first", async () => {
+		const { ends } = createMockCollector();
+		const client = new AbortController();
+		let upstream!: ReadableStreamDefaultController<Uint8Array>;
+		const translated = await translateCodex(
+			new ReadableStream<Uint8Array>({
+				start(controller) {
+					upstream = controller;
+					controller.enqueue(new TextEncoder().encode(partialCodexFrame));
+				},
+			}),
+		);
+		const response = await forwardTestStream(translated, client.signal);
+		const reader = response.body?.getReader();
+		if (!reader) throw new Error("Expected a streaming response");
+		const decoder = new TextDecoder();
+		let seen = "";
+		while (!seen.includes("partial")) {
+			const { done, value } = await reader.read();
+			if (done) throw new Error("Expected the translated content delta");
+			seen += decoder.decode(value);
+		}
+		const pending = reader.read();
+		client.abort();
+		upstream.error(client.signal.reason);
+		await expect(pending).rejects.toThrow();
+		expect(ends).toEqual([
+			expect.objectContaining({
+				success: true,
+				streamTerminalState: "client_cancelled",
+			}),
+		]);
 	});
 
 	it("tees streaming responses instead of cloning", async () => {

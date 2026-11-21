@@ -1,9 +1,13 @@
 import crypto from "node:crypto";
 import { TIME_CONSTANTS, ValidationError } from "@better-ccflare/core";
+import { Logger } from "@better-ccflare/logger";
 import type { Provider } from "@better-ccflare/providers";
 import type { RequestMeta } from "@better-ccflare/types";
 import { chatGptCloudflareCookieJar } from "../chatgpt-cloudflare-cookies";
 import { ERROR_MESSAGES, INTERNAL_PROBE_SECRET_HEADER } from "./proxy-types";
+
+const log = new Logger("ProxyRequest");
+const SLOW_HEADERS_MS = 30 * TIME_CONSTANTS.SECOND;
 
 /**
  * Internal proxy control headers that must NEVER be forwarded to the upstream
@@ -112,13 +116,7 @@ export async function makeProxyRequest(
 	const callerSignal =
 		signal ?? (target instanceof Request ? target.signal : undefined);
 
-	// The header-phase timeout is always armed, independent of the caller
-	// signal, and disarmed in `finally` once the headers are in.
 	const timeoutController = new AbortController();
-	const timeoutId: ReturnType<typeof setTimeout> | null = setTimeout(
-		() => timeoutController.abort(),
-		TIME_CONSTANTS.PROXY_REQUEST_TIMEOUT_MS,
-	);
 
 	// Both reasons must be able to abort the same fetch. Combining them keeps
 	// the caller signal live for the whole stream lifetime, whereas replacing
@@ -128,37 +126,70 @@ export async function makeProxyRequest(
 		? AbortSignal.any([callerSignal, timeoutController.signal])
 		: timeoutController.signal;
 
-	try {
-		if (target instanceof Request) {
-			const targetUrl = target.url;
-			const mutableHeaders = new Headers(target.headers);
-			stripInternalControlHeaders(mutableHeaders);
-			chatGptCloudflareCookieJar.applyCookieHeader(targetUrl, mutableHeaders);
-
-			const response = await fetch(
-				new Request(target, {
+	const targetUrl = target instanceof Request ? target.url : target;
+	const mutableHeaders = new Headers(
+		target instanceof Request ? target.headers : headers,
+	);
+	stripInternalControlHeaders(mutableHeaders);
+	chatGptCloudflareCookieJar.applyCookieHeader(targetUrl, mutableHeaders);
+	const outbound =
+		target instanceof Request
+			? new Request(target, {
 					headers: mutableHeaders,
 					signal: effectiveSignal,
-				}),
-			);
-			chatGptCloudflareCookieJar.captureFromResponse(targetUrl, response);
-			return response;
-		}
+				})
+			: target;
+	const outboundInit =
+		typeof target === "string"
+			? {
+					method,
+					headers: mutableHeaders,
+					body: createBodyStream?.(),
+					signal: effectiveSignal,
+					...(hasBody ? ({ duplex: "half" } as RequestInit) : {}),
+				}
+			: undefined;
 
-		const mutableHeaders = new Headers(headers);
-		stripInternalControlHeaders(mutableHeaders);
-		chatGptCloudflareCookieJar.applyCookieHeader(target, mutableHeaders);
+	// Both timers cover only the wait for headers. The pending warning is
+	// diagnostic and must never abort a healthy request or keep Bun alive.
+	const startedAt = performance.now();
+	let attemptId: string | undefined;
+	const details = () => {
+		attemptId ??= crypto.randomUUID();
+		return { attemptId, elapsedMs: Math.round(performance.now() - startedAt) };
+	};
+	const timeoutId = setTimeout(
+		() => timeoutController.abort(),
+		TIME_CONSTANTS.PROXY_REQUEST_TIMEOUT_MS,
+	);
+	const pendingTimer = setTimeout(() => {
+		log.warn("upstream_headers_pending", details());
+	}, SLOW_HEADERS_MS);
+	pendingTimer.unref?.();
 
-		const response = await fetch(target, {
-			method,
-			headers: mutableHeaders,
-			body: createBodyStream ? createBodyStream() : undefined,
-			signal: effectiveSignal,
-			...(hasBody ? ({ duplex: "half" } as RequestInit) : {}),
-		});
-		chatGptCloudflareCookieJar.captureFromResponse(target, response);
-		return response;
+	let response: Response;
+	try {
+		response = await fetch(outbound, outboundInit);
+	} catch (error) {
+		// The composite retains the first abort reason even if both signals
+		// have fired by the time fetch rejects.
+		const outcome =
+			timeoutController.signal.aborted &&
+			effectiveSignal.reason === timeoutController.signal.reason
+				? "header_timeout"
+				: callerSignal?.aborted
+					? "client_cancelled"
+					: "transport_error";
+		const fields = { ...details(), outcome };
+		if (outcome === "client_cancelled")
+			log.info("upstream_headers_failed", fields);
+		else log.warn("upstream_headers_failed", fields);
+		throw error;
 	} finally {
-		if (timeoutId) clearTimeout(timeoutId);
+		clearTimeout(timeoutId);
+		clearTimeout(pendingTimer);
 	}
+	if (attemptId) log.info("upstream_headers_received", details());
+	chatGptCloudflareCookieJar.captureFromResponse(targetUrl, response);
+	return response;
 }

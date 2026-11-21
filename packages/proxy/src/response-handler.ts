@@ -204,6 +204,7 @@ export interface ResponseHandlerOptions {
 	originalModel?: string | null;
 	limitModel?: string | null;
 	appliedModel?: string | null;
+	clientSignal?: AbortSignal;
 	/**
 	 * Controller whose signal was merged into the upstream fetch's
 	 * `init.signal` (see proxy-operations.ts). Passed through to the
@@ -245,6 +246,7 @@ export async function forwardToClient(
 		originalModel,
 		limitModel,
 		appliedModel,
+		clientSignal,
 		drainAbort,
 	} = options;
 
@@ -435,56 +437,28 @@ export async function forwardToClient(
 			}
 		};
 
-		const onClose = (): void => {
-			if (shouldProcessRequest) {
-				// For Anthropic-Messages-shaped SSE streams wrapped by the
-				// terminal-recovery wrapper, prefer the real observed SSE
-				// termination state over the header-only `response.ok` check —
-				// a 200 OK with a TCP close mid-content is truncated, not
-				// complete, and must not be recorded as a success. The wrapper
-				// fires `onTerminalState` synchronously before close/error, so
-				// the closure variable is already populated by the time we get
-				// here.
-				//
-				// Client-initiated cancels (Esc, tool interrupts) are passed
-				// through unchanged — preserve the prior header-based success
-				// so routine aborts don't poison the success metrics. The
-				// specific outcome is still recorded in `streamTerminalState`
-				// for observability.
-				const success = streamTerminalState
-					? streamTerminalState === "complete" ||
-						streamTerminalState === "recovered" ||
-						streamTerminalState === "client_cancelled"
-					: isExpectedResponse(path, response);
-				const error =
-					streamTerminalState === "truncated"
+		const finishStream = (readError?: Error): void => {
+			if (!shouldProcessRequest) return;
+			const success = streamTerminalState
+				? streamTerminalState === "complete" ||
+					streamTerminalState === "recovered" ||
+					streamTerminalState === "client_cancelled"
+				: !readError && isExpectedResponse(path, response);
+			const error = !success
+				? (readError?.message ??
+					(streamTerminalState === "truncated"
 						? "stream_truncated_mid_content"
 						: streamTerminalState === "error"
 							? "stream_in_band_error"
-							: undefined;
-				const endMsg: EndMessage = {
-					type: "end",
-					requestId,
-					success,
-					error,
-					streamTerminalState: streamTerminalState ?? null,
-				};
-				// Fire-and-forget: handleEnd is async for DB writes but we don't block streaming
-				fireAndForgetEnd(endMsg);
-			}
-		};
-
-		const onError = (err: Error): void => {
-			if (shouldProcessRequest) {
-				const endMsg: EndMessage = {
-					type: "end",
-					requestId,
-					success: false,
-					error: err.message,
-					streamTerminalState: streamTerminalState ?? null,
-				};
-				fireAndForgetEnd(endMsg);
-			}
+							: undefined))
+				: undefined;
+			fireAndForgetEnd({
+				type: "end",
+				requestId,
+				success,
+				error,
+				streamTerminalState,
+			});
 		};
 
 		// Anthropic-Messages-shaped SSE response detection — covers native
@@ -509,6 +483,7 @@ export async function forwardToClient(
 		const responseBody = isAnthropicMessagesSseResponse
 			? createAnthropicTerminalRecoveryStream(response.body, {
 					drainAbort,
+					clientSignal,
 					onRecovery(reason) {
 						log.warn("anthropic_terminal_message_stop_recovered", {
 							requestId,
@@ -551,8 +526,9 @@ export async function forwardToClient(
 		const passthroughBody = teeStream(responseBody, {
 			collect: false,
 			onChunk,
-			onClose,
-			onError,
+			onClose: () => finishStream(),
+			onError: finishStream,
+			propagateCancel: isAnthropicMessagesSseResponse,
 		});
 		// Keep provider/accounting observers on the unmodified upstream bytes.
 		// Only the final client-facing stream presents the model id requested by

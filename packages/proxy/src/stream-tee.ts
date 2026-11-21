@@ -12,6 +12,8 @@ export function teeStream(
 		onError?: (error: Error) => void;
 		maxBytes?: number; // Max bytes to buffer (default: 1MB)
 		collect?: boolean; // Set false to skip buffering; onClose receives []
+		/** Only for JS-owned wrappers that classify cancellation and drain their own source. */
+		propagateCancel?: boolean;
 	} = {},
 ): ReadableStream<Uint8Array> {
 	const {
@@ -20,21 +22,25 @@ export function teeStream(
 		onError,
 		maxBytes = BUFFER_SIZES.STREAM_TEE_MAX_BYTES,
 		collect = true,
+		propagateCancel = false,
 	} = options;
 	const reader = upstream.getReader();
 	const buffered: Uint8Array[] = [];
 	let totalBytes = 0;
 	let truncated = false;
+	let finalized = false;
 
 	return new ReadableStream({
 		async pull(controller) {
 			try {
 				const { value, done } = await reader.read();
+				if (finalized) return;
 
 				if (done) {
-					onClose?.(buffered);
 					controller.close();
 					reader.releaseLock();
+					finalized = true;
+					onClose?.(buffered);
 					return;
 				}
 
@@ -60,13 +66,26 @@ export function teeStream(
 				// Notify chunk handler
 				onChunk?.(value);
 			} catch (error) {
+				if (finalized) return;
+				finalized = true;
 				onError?.(error as Error);
 				controller.error(error);
 				reader.releaseLock();
 			}
 		},
 
-		cancel() {
+		cancel(reason) {
+			if (finalized) return;
+			finalized = true;
+			if (propagateCancel) {
+				// The wrapper marks client_cancelled synchronously and owns the drain.
+				void reader
+					.cancel(reason)
+					.catch(() => undefined)
+					.finally(() => reader.releaseLock());
+				onClose?.(buffered);
+				return;
+			}
 			// A client-initiated cancel (Esc, tab close, network drop) must
 			// finalize the same way a clean `done` does — otherwise the
 			// caller's onClose (and whatever it drives, e.g. usage-collector's
