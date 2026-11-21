@@ -664,6 +664,92 @@ describe("proxyWithAccount — transient upstream 5xx retry and failover", () =>
 		expect(account.consecutive_rate_limits).toBe(0);
 	});
 
+	function makeCodexAccount() {
+		return makeAccount({
+			provider: "codex",
+			api_key: null,
+			access_token: "synthetic-codex-access-token",
+			expires_at: Date.now() + 3_600_000,
+			custom_endpoint: "http://127.0.0.1:9/responses",
+			model_mappings: '{"sonnet":"gpt-6.1-terra"}',
+		});
+	}
+
+	function codexStreamFailure() {
+		const data = JSON.stringify({
+			type: "response.failed",
+			response: {
+				status: "failed",
+				error: { code: "server_error", message: "Synthetic Codex failure" },
+			},
+		});
+		return new Response(`event: response.failed\ndata: ${data}\n\n`, {
+			headers: { "content-type": "text/event-stream" },
+		});
+	}
+
+	it.each([
+		false,
+		true,
+	])("does not bench on a Codex stream translated to 502 (last account: %s)", async (last) => {
+		const fetch = mock(async () => codexStreamFailure());
+		globalThis.fetch = fetch;
+		const ctx = makeProxyContext();
+		const account = makeCodexAccount();
+		const buf = makeRequestBody();
+		const { result, forwarded } = await runProxy(
+			makeRequest(buf),
+			account,
+			buf,
+			ctx,
+			last,
+		);
+		expect(fetch).toHaveBeenCalledTimes(1);
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+		expect(forwarded).toBe(last);
+		if (last) {
+			expect(result?.status).toBe(502);
+			expect(await result?.json()).toMatchObject({
+				error: { message: "Synthetic Codex failure" },
+			});
+		} else {
+			expect(result).toBeNull();
+			expect(saveCalls(ctx)).toHaveLength(1);
+			expect(saveCalls(ctx)[0]?.[6]).toBe("codex_translated_502");
+		}
+	});
+
+	it("uses the latest raw status when a Codex HTTP 502 retry becomes a stream failure", async () => {
+		let count = 0;
+		globalThis.fetch = mock(async () =>
+			++count === 1 ? serverErrorResponse(502) : codexStreamFailure(),
+		);
+		const ctx = makeProxyContext();
+		const account = makeCodexAccount();
+		const buf = makeRequestBody();
+		const { result } = await runProxy(makeRequest(buf), account, buf, ctx);
+		expect(result).toBeNull();
+		expect(count).toBe(2);
+		expect(account.rate_limited_until).toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).not.toHaveBeenCalled();
+		expect(saveCalls(ctx)[0]?.[6]).toBe("codex_translated_502");
+	});
+
+	it("still retries and benches after a real Codex HTTP 502", async () => {
+		const fetch = mock(async () => serverErrorResponse(502));
+		globalThis.fetch = fetch;
+		const ctx = makeProxyContext();
+		const account = makeCodexAccount();
+		const buf = makeRequestBody();
+		const { result } = await runProxy(makeRequest(buf), account, buf, ctx);
+		expect(result).toBeNull();
+		expect(fetch).toHaveBeenCalledTimes(2);
+		expect(account.rate_limited_reason).toBe("upstream_5xx_server_error");
+		expect(account.rate_limited_until).not.toBeNull();
+		expect(ctx.dbOps.markAccountRateLimited).toHaveBeenCalledTimes(1);
+	});
+
 	it("records an audit row for the failed attempt before failing over", async () => {
 		// The production incident was diagnosed from exactly this row. Without
 		// it the 36-60s the request spent on the broken account vanishes from

@@ -3922,6 +3922,14 @@ async function proxyWithAccountAttempt(
 			headers: responseHeaders,
 		});
 
+		// Keep the wire status separate from failures translated by the adapter.
+		let upstreamStatus = rawResponse.status;
+		const isCodexTranslated502 = (result: Response) =>
+			provider.name === "codex" &&
+			upstreamStatus >= 200 &&
+			upstreamStatus < 300 &&
+			result.status === 502;
+
 		// Process response (transform format, sanitize headers, etc.) using account-specific provider
 		let response = await provider.processResponse(
 			taggedRawResponse,
@@ -3979,6 +3987,7 @@ async function proxyWithAccountAttempt(
 				statusText: retryRaw.statusText,
 				headers: retryTaggedHeaders,
 			});
+			upstreamStatus = retryRaw.status;
 			return provider.processResponse(
 				retryTaggedRaw,
 				account,
@@ -4119,6 +4128,9 @@ async function proxyWithAccountAttempt(
 
 			if (retryCfg.enabled && retryCfg.maxAttempts > 1) {
 				for (let attempt = 1; attempt < retryCfg.maxAttempts; attempt++) {
+					// The failed stream can fail over, but replaying it in place
+					// only delays that failover and amplifies a request failure.
+					if (isCodexTranslated502(response)) break;
 					// `x-should-retry: false` is the upstream telling us the
 					// response in hand is deterministic for this request.
 					// Anthropic sends it on the 500s that a replay cannot fix;
@@ -4165,37 +4177,35 @@ async function proxyWithAccountAttempt(
 			}
 
 			if (isTransientServerErrorStatus(response.status)) {
-				// A Retry-After shorter than the fixed bench is honored literally;
-				// applyRateLimitCooldown clamps anything longer to the cooldown.
-				const retryAfterUntil = parseRetryAfterUntil(response, Date.now());
-				const reason: RateLimitReason = "upstream_5xx_server_error";
-				applyRateLimitCooldown(
-					account,
-					retryAfterUntil != null
-						? { reason, resetTime: retryAfterUntil }
-						: { reason },
-					ctx,
-				);
-				// Report the bench that was actually applied — the forward guard
-				// in applyRateLimitCooldown keeps a longer active cooldown instead
-				// of this one, and the log should say what is true.
+				const translated = isCodexTranslated502(response);
+				const reason = translated
+					? "codex_translated_502"
+					: "upstream_5xx_server_error";
+				const isTerminalAttempt = returnRateLimitedResponseOnExhaustion;
+				if (!translated) {
+					// Honour a shorter Retry-After. A longer one is capped by
+					// the cooldown, unless there is a longer existing bench.
+					const retryAfterUntil = parseRetryAfterUntil(response, Date.now());
+					applyRateLimitCooldown(
+						account,
+						retryAfterUntil != null
+							? {
+									reason: "upstream_5xx_server_error",
+									resetTime: retryAfterUntil,
+								}
+							: { reason: "upstream_5xx_server_error" },
+						ctx,
+					);
+				}
+				const action = isTerminalAttempt ? "forwarding error" : "failing over";
 				const benchMs = Math.max(
 					0,
-					(account.rate_limited_until ?? Date.now()) - Date.now(),
+					(account.rate_limited_until ?? 0) - Date.now(),
 				);
-				// On the last candidate account, fall through instead of failing
-				// over: the account loop has nowhere left to go, and the client
-				// learns more from the real upstream status than from a synthetic
-				// pool_exhausted. Mirrors the terminal-529 handling below — the
-				// bench still applies, and response-processor.ts deliberately does
-				// not clear it on a 5xx.
-				const isTerminalAttempt = returnRateLimitedResponseOnExhaustion;
 				log.warn(
-					`Account ${account.name}: upstream ${response.status} after ${attemptsMade} attempt(s), benching for ${benchMs} ms and ${
-						isTerminalAttempt
-							? "forwarding the upstream response (last candidate account)"
-							: "failing over"
-					}`,
+					translated
+						? `Account ${account.name}: Codex HTTP ${upstreamStatus} translated to 502, ${action} without account cooldown`
+						: `Account ${account.name}: upstream ${response.status} after ${attemptsMade} attempt(s), benching for ${benchMs} ms and ${action}`,
 				);
 
 				if (!isTerminalAttempt) {
@@ -4253,7 +4263,7 @@ async function proxyWithAccountAttempt(
 					cancelDiscardedResponseBody(response);
 					return null;
 				}
-				terminalServerErrorBenched = true;
+				terminalServerErrorBenched = !translated;
 			}
 		}
 
